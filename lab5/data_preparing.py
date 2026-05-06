@@ -1,214 +1,330 @@
+import os
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 from sklearn.model_selection import train_test_split
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
-from sklearn.impute import SimpleImputer
-from sklearn.preprocessing import OneHotEncoder, StandardScaler, LabelEncoder
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix, ConfusionMatrixDisplay
+
+FILE_PATH = 'dataset.data'  
+TARGET_COLUMN = "landmass" 
+TEST_SIZE = 0.2 # test size in %
+RANDOM_STATE = 42   # random number for spliting on test and teach sequence
+
+AUTO_DETECT_TARGET = True
+
+MISSING_STRATEGY = "median" # drop_rows, median, meam
 
 
-# read
-df = pd.read_csv("dataset.data")
 
-# skip values
-print("\nКоличество пропущенных значений:")
-print(df.isna().sum())
+def safe_read_csv(file_path):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Файл не найден: {file_path}")
 
-TARGET_COL = "landmass"
+    separators = [',', ';', '\t', r'\s+']
+    last_error = None
 
-# used features (set manually)
-flag_features = [
-    "bars",
-    "stripes",
-    "colours",
-    "red",
-    "green",
-    "blue",
-    "gold",
-    "white",
-    "black",
-    "orange",
-    "mainhue",
-    "circles",
-    "crosses",
-    "saltires",
-    "quarters",
-    "sunstars",
-    "crescent",
-    "triangle",
-    "icon",
-    "animate",
-    "text",
-    "topleft",
-    "botright"
-]
+    for sep in separators:
+        try:
+            df = pd.read_csv(file_path, sep=sep, engine='python')
+            if df.shape[1] > 1:
+                return df
+        except Exception as e:
+            last_error = e
 
-X = df[flag_features].copy()
-y = df[TARGET_COL].copy()
+    raise ValueError(f"Не удалось корректно прочитать файл {file_path}. Последняя ошибка: {last_error}")
 
-print("\nИспользуемые признаки флага:")
-print(flag_features)
 
-missing_counts = X.isna().sum()
-missing_nonzero = missing_counts[missing_counts > 0].sort_values(ascending=False)
+def clean_columns(df):
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.replace(r'\s+', '_', regex=True)
+    )
+    return df
 
-if not missing_nonzero.empty:
-    plt.figure(figsize=(12, 5))
-    missing_nonzero.plot(kind="bar")
-    plt.title("Количество пропущенных значений в признаках флага")
-    plt.ylabel("Число пропусков")
-    plt.xticks(rotation=45, ha="right")
+
+def try_convert_object_to_numeric(df, threshold=0.8):
+    df = df.copy()
+
+    for col in df.columns:
+        if df[col].dtype == 'object':
+            converted = pd.to_numeric(df[col], errors='coerce')
+            non_null_ratio = converted.notna().mean()
+
+            if non_null_ratio >= threshold:
+                df[col] = converted
+
+    return df
+
+
+def detect_target_column(df):
+    common_targets = [
+        'target', 'label', 'class', 'y', 'output', 'result',
+        'survived', 'species', 'diagnosis', 'price'
+    ]
+
+    lower_map = {col.lower(): col for col in df.columns}
+
+    for candidate in common_targets:
+        if candidate in lower_map:
+            return lower_map[candidate]
+
+    candidate_cols = []
+    for col in df.columns:
+        nunique = df[col].nunique(dropna=True)
+        if 2 <= nunique <= 20:
+            candidate_cols.append(col)
+
+    if candidate_cols:
+        return candidate_cols[-1]
+
+    return df.columns[-1]
+
+
+def choose_task_type(y):
+    nunique = y.nunique(dropna=True)
+    if y.dtype == 'object' or nunique <= 20:
+        return 'classification'
+    return 'regression'
+
+
+def safe_plot_histograms(df):
+    numeric_df = df.select_dtypes(include=[np.number])
+
+    if numeric_df.shape[1] == 0:
+        print("\nНет числовых столбцов для гистограмм.")
+        return
+
+    numeric_df.hist(figsize=(12, 8))
     plt.tight_layout()
     plt.show()
-else:
-    print("\nПропущенных значений среди признаков флага нет.")
 
-plt.figure(figsize=(8, 5))
-pd.Series(y).astype(str).value_counts().sort_index().plot(kind="bar")
-plt.title("Распределение классов landmass")
-plt.ylabel("Количество объектов")
-plt.xlabel("Код континента")
-plt.tight_layout()
-plt.show()
 
-numeric_preview = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
-if len(numeric_preview) > 0:
-    X[numeric_preview].hist(figsize=(14, 8), bins=15)
-    plt.suptitle("Распределения числовых признаков флага", y=1.02)
+def safe_plot_missing_heatmap(df):
+    if df.empty:
+        print("\nПустой DataFrame. Тепловая карта пропусков не построена.")
+        return
+
+    plt.figure(figsize=(10, 6))
+    sns.heatmap(df.isnull(), cbar=False, cmap='viridis')
+    plt.title('Карта пропущенных значений')
     plt.tight_layout()
     plt.show()
 
 
-categorical_features = X.select_dtypes(include=["object"]).columns.tolist()
-numeric_features = X.select_dtypes(include=["int64", "float64"]).columns.tolist()
+def safe_plot_target(df, target_col):
+    if target_col is None or target_col not in df.columns:
+        print("\nЦелевой столбец не найден. График целевой переменной пропущен.")
+        return
 
-print("\nКатегориальные признаки:")
-print(categorical_features)
+    series = df[target_col]
+    nunique = series.nunique(dropna=True)
+
+    plt.figure(figsize=(8, 5))
+
+    if series.dtype == 'object' or nunique <= 20:
+        sns.countplot(x=target_col, data=df)
+        plt.title(f'Распределение целевой переменной: {target_col}')
+        plt.xticks(rotation=45)
+    else:
+        sns.histplot(series.dropna(), kde=True)
+        plt.title(f'Распределение целевой переменной: {target_col}')
+
+    plt.tight_layout()
+    plt.show()
+
+
+def validate_missing_strategy(strategy):
+    allowed = {"drop_rows", "mean", "median", "most_frequent"}
+    if strategy not in allowed:
+        raise ValueError(
+            f"Недопустимая стратегия заполнения пропусков: {strategy}. "
+            f"Доступные варианты: {sorted(allowed)}"
+        )
+
+
+def drop_missing_rows(X, y):
+    combined = pd.concat([X, y], axis=1)
+    before_shape = combined.shape
+    combined = combined.dropna()
+    after_shape = combined.shape
+
+    X_clean = combined.iloc[:, :-1]
+    y_clean = combined.iloc[:, -1]
+
+    print(f"\nУдаление строк с пропусками:")
+    print(f"Было строк: {before_shape[0]}")
+    print(f"Стало строк: {after_shape[0]}")
+    print(f"Удалено строк: {before_shape[0] - after_shape[0]}")
+
+    return X_clean, y_clean
+
+
+def build_preprocessor(numeric_features, categorical_features, missing_strategy):
+    transformers = []
+
+    if missing_strategy == "mean":
+        numeric_imputer_strategy = "mean"
+        categorical_imputer_strategy = "most_frequent"
+    elif missing_strategy == "median":
+        numeric_imputer_strategy = "median"
+        categorical_imputer_strategy = "most_frequent"
+    elif missing_strategy == "most_frequent":
+        numeric_imputer_strategy = "most_frequent"
+        categorical_imputer_strategy = "most_frequent"
+    else:
+        numeric_imputer_strategy = None
+        categorical_imputer_strategy = None
+
+    if numeric_features:
+        numeric_steps = []
+        if numeric_imputer_strategy is not None:
+            numeric_steps.append(('imputer', SimpleImputer(strategy=numeric_imputer_strategy)))
+        numeric_steps.append(('scaler', StandardScaler()))
+
+        numeric_transformer = Pipeline(steps=numeric_steps)
+        transformers.append(('num', numeric_transformer, numeric_features))
+
+    if categorical_features:
+        categorical_steps = []
+        if categorical_imputer_strategy is not None:
+            categorical_steps.append(('imputer', SimpleImputer(strategy=categorical_imputer_strategy)))
+        categorical_steps.append(('onehot', OneHotEncoder(handle_unknown='ignore')))
+
+        categorical_transformer = Pipeline(steps=categorical_steps)
+        transformers.append(('cat', categorical_transformer, categorical_features))
+
+    return ColumnTransformer(transformers=transformers)
+
+
+try:
+    validate_missing_strategy(MISSING_STRATEGY)
+    df = safe_read_csv(FILE_PATH)
+except Exception as e:
+    print(f"Ошибка при загрузке данных: {e}")
+    raise SystemExit(1)
+
+df = clean_columns(df)
+df = try_convert_object_to_numeric(df)
+
+print("Первые 5 строк:")
+print(df.head())
+
+print("\nРазмер датасета:")
+print(df.shape)
+
+print("\nНазвания столбцов:")
+print(df.columns.tolist())
+
+print("\nТипы данных:")
+print(df.dtypes)
+
+print("\nОбщая информация:")
+df.info()
+
+print("\nСтатистика числовых признаков:")
+print(df.describe())
+
+print("\nКоличество пропусков:")
+print(df.isnull().sum())
+
+
+safe_plot_histograms(df)
+safe_plot_missing_heatmap(df)
+
+
+target_col = TARGET_COLUMN
+
+if target_col is None and AUTO_DETECT_TARGET:
+    target_col = detect_target_column(df)
+    print(f"\nАвтоматически выбран целевой столбец: {target_col}")
+
+if target_col not in df.columns:
+    print("\nНе удалось определить целевой столбец.")
+    print("Укажите TARGET_COLUMN вручную.")
+    raise SystemExit(1)
+
+safe_plot_target(df, target_col)
+
+
+X = df.drop(columns=[target_col]).copy()
+y = df[target_col].copy()
+
+if X.shape[1] == 0:
+    print("После удаления целевой переменной не осталось признаков.")
+    raise SystemExit(1)
+
+print(f"\nЦелевая переменная: {target_col}")
+
+task_type = choose_task_type(y)
+print(f"Предполагаемый тип задачи: {task_type}")
+
+
+if MISSING_STRATEGY == "drop_rows":
+    X, y = drop_missing_rows(X, y)
+
+    if X.empty or len(y) == 0:
+        print("После удаления строк с пропусками данные закончились.")
+        raise SystemExit(1)
+
+
+numeric_features = X.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = X.select_dtypes(exclude=[np.number]).columns.tolist()
 
 print("\nЧисловые признаки:")
 print(numeric_features)
 
-label_encoder = None
+print("\nКатегориальные признаки:")
+print(categorical_features)
 
-if y.dtype == "object":
-    label_encoder = LabelEncoder()
-    y = label_encoder.fit_transform(y.astype(str))
-else:
-    y = y.values
+if len(numeric_features) == 0 and len(categorical_features) == 0:
+    print("Не удалось определить признаки для обработки.")
+    raise SystemExit(1)
 
-transformers = []
 
-if len(numeric_features) > 0:
-    numeric_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler())
-    ])
-    transformers.append(("num", numeric_transformer, numeric_features))
-
-if len(categorical_features) > 0:
-    categorical_transformer = Pipeline(steps=[
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("encoder", OneHotEncoder(handle_unknown="ignore"))
-    ])
-    transformers.append(("cat", categorical_transformer, categorical_features))
-
-preprocessor = ColumnTransformer(transformers=transformers)
-
-unique_classes = np.unique(y)
-stratify_value = y if len(unique_classes) > 1 else None
-
-X_train, X_test, y_train, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=stratify_value
+preprocessor = build_preprocessor(
+    numeric_features=numeric_features,
+    categorical_features=categorical_features,
+    missing_strategy=MISSING_STRATEGY
 )
 
-print("\nРазмер обучающей выборки:", X_train.shape)
-print("Размер тестовой выборки:", X_test.shape)
 
-
-model = Pipeline(steps=[
-    ("preprocessor", preprocessor),
-    ("classifier", RandomForestClassifier(
-        n_estimators=300,
-        random_state=42
-    ))
-])
-
-model.fit(X_train, y_train)
-
-
-
-y_pred = model.predict(X_test)
-
-
-acc = accuracy_score(y_test, y_pred)
-print("\nAccuracy:", round(acc, 4))
-
-print("\nClassification report:")
-print(classification_report(y_test, y_pred, zero_division=0))
-
-
-cm = confusion_matrix(y_test, y_pred)
-
-fig, ax = plt.subplots(figsize=(8, 6))
-disp = ConfusionMatrixDisplay(confusion_matrix=cm)
-disp.plot(ax=ax)
-plt.title("Матрица ошибок для предсказания landmass")
-plt.tight_layout()
-plt.show()
-
+stratify_value = None
+if task_type == 'classification':
+    class_counts = y.value_counts(dropna=False)
+    if len(class_counts) > 1 and class_counts.min() >= 2:
+        stratify_value = y
 
 try:
-    fitted_preprocessor = model.named_steps["preprocessor"]
-    fitted_classifier = model.named_steps["classifier"]
-
-    feature_names = fitted_preprocessor.get_feature_names_out()
-    importances = fitted_classifier.feature_importances_
-
-    importance_df = pd.DataFrame({
-        "Признак": feature_names,
-        "Важность": importances
-    }).sort_values(by="Важность", ascending=False)
-
-    print("\nТоп-20 самых важных признаков:")
-    print(importance_df.head(20))
-
-    plt.figure(figsize=(12, 8))
-    top_features = importance_df.head(20).sort_values(by="Важность")
-    plt.barh(top_features["Признак"], top_features["Важность"])
-    plt.title("Топ-20 важных признаков флага")
-    plt.xlabel("Важность")
-    plt.tight_layout()
-    plt.show()
-
-except Exception as e:
-    print("\nНе удалось построить важность признаков.")
-    print("Причина:", e)
-
-
-try:
-    X_train_transformed = model.named_steps["preprocessor"].fit_transform(X_train)
-
-    if hasattr(X_train_transformed, "toarray"):
-        X_train_transformed = X_train_transformed.toarray()
-
-    transformed_feature_names = model.named_steps["preprocessor"].get_feature_names_out()
-
-    X_train_transformed_df = pd.DataFrame(
-        X_train_transformed,
-        columns=transformed_feature_names
+    X_train, X_test, y_train, y_test = train_test_split(
+        X,
+        y,
+        test_size=TEST_SIZE,
+        random_state=RANDOM_STATE,
+        stratify=stratify_value
     )
-
-    print("\nПервые 5 строк обработанных признаков:")
-    print(X_train_transformed_df.head())
-
 except Exception as e:
-    print("\nНе удалось вывести обработанные данные.")
-    print("Причина:", e)
+    print(f"\nОшибка при разделении данных: {e}")
+    raise SystemExit(1)
+
+
+try:
+    X_train_processed = preprocessor.fit_transform(X_train)
+    X_test_processed = preprocessor.transform(X_test)
+except Exception as e:
+    print(f"\nОшибка при предварительной обработке: {e}")
+    raise SystemExit(1)
+
+print("\nВыбранная стратегия обработки пропусков:", MISSING_STRATEGY)
+print("Размер обучающей выборки до обработки:", X_train.shape)
+print("Размер тестовой выборки до обработки:", X_test.shape)
+print("Размер обучающей выборки после обработки:", X_train_processed.shape)
+print("Размер тестовой выборки после обработки:", X_test_processed.shape)
+
+print("\nПредварительная обработка успешно завершена.")
